@@ -1,3 +1,4 @@
+import base64
 import csv
 import json
 import os
@@ -11,6 +12,7 @@ from bs4 import BeautifulSoup
 import gspread
 from google.oauth2.service_account import Credentials
 
+
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
                   "(KHTML, like Gecko) Chrome/122.0 Safari/537.36"
@@ -19,6 +21,9 @@ TIMEOUT = 30
 
 MAX_PAGES_PER_CATALOG = 200
 SLEEP_BETWEEN_REQUESTS_SEC = 0.6
+SLEEP_BETWEEN_PAGES_SEC = 0.8
+
+HEADER = ["url", "name", "category", "color", "size", "stock"]
 
 SIZE_RE = re.compile(
     r"^(XS|S|M|L|XL|XXL|XXXL|XXXS|ONE SIZE|OS|O/S|"
@@ -26,8 +31,6 @@ SIZE_RE = re.compile(
     r"\d+([.,]\d+)?)$",
     re.IGNORECASE
 )
-
-HEADER = ["url", "name", "category", "color", "size", "stock"]
 
 
 def log(msg: str):
@@ -46,7 +49,8 @@ def fetch(url: str) -> str:
 
 def load_catalog_urls() -> list[str]:
     with open("catalog.txt", "r", encoding="utf-8") as f:
-        return [line.strip() for line in f if line.strip() and not line.strip().startswith("#")]
+        urls = [line.strip() for line in f if line.strip() and not line.strip().startswith("#")]
+    return urls
 
 
 def catalog_page_url(catalog_url: str, page: int) -> str:
@@ -57,7 +61,9 @@ def catalog_page_url(catalog_url: str, page: int) -> str:
 
 
 def get_breadcrumb_category(soup: BeautifulSoup) -> str:
-    crumbs = soup.select("nav.breadcrumbs a, .breadcrumbs a, [aria-label='breadcrumb'] a, .breadcrumb a")
+    crumbs = soup.select(
+        "nav.breadcrumbs a, .breadcrumbs a, [aria-label='breadcrumb'] a, .breadcrumb a"
+    )
     txts = [clean_text(c.get_text(" ", strip=True)) for c in crumbs]
     txts = [t for t in txts if t]
     if len(txts) >= 2:
@@ -66,6 +72,9 @@ def get_breadcrumb_category(soup: BeautifulSoup) -> str:
 
 
 def extract_product_links_from_catalog(soup: BeautifulSoup, base_url: str) -> list[str]:
+    """
+    Kixbox/InSales: ссылки на товары содержат /product/
+    """
     urls = []
     for a in soup.select('a[href*="/product/"]'):
         href = a.get("href", "")
@@ -76,6 +85,7 @@ def extract_product_links_from_catalog(soup: BeautifulSoup, base_url: str) -> li
             continue
         urls.append(full)
 
+    # уникализируем с сохранением порядка
     seen = set()
     uniq = []
     for u in urls:
@@ -115,18 +125,24 @@ def parse_product_page(product_url: str) -> dict:
     html = fetch(product_url)
     soup = BeautifulSoup(html, "lxml")
 
+    # NAME
     name = ""
     h1 = soup.select_one("h1")
     if h1:
         name = clean_text(h1.get_text(" ", strip=True))
 
+    # CATEGORY
     category = get_breadcrumb_category(soup)
 
+    # STOCK (эвристика по тексту)
     page_text = clean_text(soup.get_text(" ", strip=True))
     page_text_lower = page_text.lower()
     stock = parse_stock_from_text(page_text_lower)
 
+    # COLOR (эвристики)
     color = ""
+
+    # 1) строка вида "Цвет: XXX"
     for s in soup.stripped_strings:
         t = clean_text(s)
         if t.lower().startswith("цвет:"):
@@ -135,6 +151,7 @@ def parse_product_page(product_url: str) -> dict:
                 color = cand
                 break
 
+    # 2) блок характеристик
     if not color:
         props = soup.select(".properties, .product-properties, .characteristics, .product-params, .product__properties")
         for p in props:
@@ -147,6 +164,7 @@ def parse_product_page(product_url: str) -> dict:
             if color:
                 break
 
+    # 3) фоллбек: первая “похожая” строка
     if not color:
         candidates = []
         for s in soup.stripped_strings:
@@ -156,12 +174,16 @@ def parse_product_page(product_url: str) -> dict:
         if candidates:
             color = candidates[0]
 
+    # SIZES
     sizes = []
+
+    # select options
     for opt in soup.select("select option"):
         t = clean_text(opt.get_text(" ", strip=True))
         if SIZE_RE.match(t):
             sizes.append(t.upper().replace("  ", " "))
 
+    # кнопки/ссылки размеров
     for el in soup.select("a, button, span, div"):
         t = clean_text(el.get_text(" ", strip=True))
         if not t:
@@ -181,28 +203,35 @@ def parse_product_page(product_url: str) -> dict:
     }
 
 
+# ---------------- Google Sheets ----------------
+
 def init_sheet():
-    import base64
-
+    """
+    ВАЖНО: используем ТОЛЬКО base64 ключ.
+    Это гарантирует, что json.loads не сломается из-за форматирования переменной окружения.
+    """
     sheet_id = os.getenv("GOOGLE_SHEET_ID", "").strip()
-
-    sa_json_b64 = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON_B64", "").strip()
-    sa_json_plain = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON", "").strip()
+    sa_b64 = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON_B64", "").strip()
 
     if not sheet_id:
-        raise RuntimeError("Нет переменной окружения GOOGLE_SHEET_ID")
+        raise RuntimeError("ENV GOOGLE_SHEET_ID не задан")
+    if not sa_b64:
+        raise RuntimeError("ENV GOOGLE_SERVICE_ACCOUNT_JSON_B64 не задан (проверь Render → Environment)")
 
-    if sa_json_b64:
-        # самый надежный вариант
-        sa_json = base64.b64decode(sa_json_b64).decode("utf-8")
-    elif sa_json_plain:
-        # на случай если plain всё-таки корректный
-        sa_json = sa_json_plain
-    else:
-        raise RuntimeError("Нет GOOGLE_SERVICE_ACCOUNT_JSON_B64 (и нет GOOGLE_SERVICE_ACCOUNT_JSON)")
+    # Диагностика (безопасно: не печатаем ключ, только длины и префикс)
+    log(f"init_sheet: GOOGLE_SHEET_ID length={len(sheet_id)}")
+    log(f"init_sheet: GOOGLE_SERVICE_ACCOUNT_JSON_B64 length={len(sa_b64)}")
+    log(f"init_sheet: B64 prefix={sa_b64[:12]!r}")
 
-    # иногда Render добавляет невидимые символы — подчистим
-    sa_json = sa_json.strip()
+    try:
+        sa_json = base64.b64decode(sa_b64).decode("utf-8").strip()
+    except Exception as e:
+        raise RuntimeError(f"init_sheet: не смог декодировать base64 ключ: {e}")
+
+    log(f"init_sheet: decoded startswith={sa_json[:12]!r}")
+    if not sa_json.startswith("{"):
+        raise RuntimeError("init_sheet: декодированный ключ не похож на JSON (не начинается с '{'). "
+                           "Значит base64 строка неверная или не от полного файла.")
 
     info = json.loads(sa_json)
 
@@ -224,7 +253,6 @@ def sheet_reset(ws):
 
 
 def sheet_append_rows(ws, rows: list[list[str]]):
-    # rows: list of [url, name, category, color, size, stock]
     ws.append_rows(rows, value_input_option="RAW")
 
 
@@ -236,18 +264,24 @@ def save_csv_fallback(all_rows: list[dict], path: str = "output.csv"):
 
 
 def main():
-    batch_size = int(os.getenv("SHEETS_BATCH_SIZE", "300"))
+    # батч
+    try:
+        batch_size = int(os.getenv("SHEETS_BATCH_SIZE", "300").strip())
+    except Exception:
+        batch_size = 300
+
     catalog_urls = load_catalog_urls()
     if not catalog_urls:
         log("catalog.txt пустой — нечего парсить.")
         return
 
+    # Инициализируем Sheets
     ws = init_sheet()
     sheet_reset(ws)
     log("Google Sheet очищен и заголовок записан. Начинаю парсинг...")
 
-    all_rows_dict: list[dict] = []  # только как запасной CSV
-    buffer_rows: list[list[str]] = []
+    all_rows_dict: list[dict] = []      # запасной CSV
+    buffer_rows: list[list[str]] = []   # батч на запись в Sheets
     total_written = 0
 
     def flush_buffer():
@@ -318,14 +352,11 @@ def main():
 
                 time.sleep(SLEEP_BETWEEN_REQUESTS_SEC)
 
-            time.sleep(0.8)
+            time.sleep(SLEEP_BETWEEN_PAGES_SEC)
 
-    # финальная запись
     flush_buffer()
-
-    # запасной CSV
     save_csv_fallback(all_rows_dict, "output.csv")
-    log("Готово. Таблица заполнена, CSV сохранён как запасной вариант (output.csv).")
+    log("Готово. Таблица заполнена по ходу работы, CSV сохранён как запасной вариант (output.csv).")
 
 
 if __name__ == "__main__":
