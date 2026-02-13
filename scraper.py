@@ -1,3 +1,4 @@
+print("Файлы в текущей папке:", __import__("os").listdir())
 import csv
 import re
 import time
