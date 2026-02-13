@@ -1,4 +1,6 @@
 import csv
+import json
+import os
 import re
 import time
 from urllib.parse import urljoin
@@ -6,15 +8,18 @@ from urllib.parse import urljoin
 import requests
 from bs4 import BeautifulSoup
 
+# --- Google Sheets ---
+import gspread
+from google.oauth2.service_account import Credentials
+
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
                   "(KHTML, like Gecko) Chrome/122.0 Safari/537.36"
 }
 TIMEOUT = 30
 
-MAX_PAGES_PER_CATALOG = 200
+MAX_PAGES_PER_CATALOG = 300
 SLEEP_BETWEEN_REQUESTS_SEC = 0.6
-
 
 SIZE_RE = re.compile(
     r"^(XS|S|M|L|XL|XXL|XXXL|XXXS|ONE SIZE|OS|O/S|"
@@ -60,28 +65,7 @@ def get_breadcrumb_category(soup: BeautifulSoup) -> str:
     return ""
 
 
-def looks_like_color(text: str) -> bool:
-    t = clean_text(text)
-    if not t:
-        return False
-    tl = t.lower()
-    bad = [
-        "₽", "руб", "в сплит", "добавить", "корзин", "купить",
-        "нет в наличии", "в наличии", "предзаказ", "sale", "скидк",
-        "размер", "цвет"
-    ]
-    if any(b in tl for b in bad):
-        return False
-    if 2 <= len(t) <= 40 and re.search(r"[A-Za-zА-Яа-я]", t):
-        return True
-    return False
-
-
 def extract_product_links_from_catalog(soup: BeautifulSoup, base_url: str) -> list[str]:
-    """
-    Собираем ссылки на товары со страницы каталога.
-    На InSales обычно /product/....
-    """
     urls = []
     for a in soup.select('a[href*="/product/"]'):
         href = a.get("href", "")
@@ -111,6 +95,23 @@ def parse_stock_from_text(page_text_lower: str) -> str:
     return ""
 
 
+def looks_like_color(text: str) -> bool:
+    t = clean_text(text)
+    if not t:
+        return False
+    tl = t.lower()
+    bad = [
+        "₽", "руб", "в сплит", "добавить", "корзин", "купить",
+        "нет в наличии", "в наличии", "предзаказ", "sale", "скидк",
+        "размер", "цвет"
+    ]
+    if any(b in tl for b in bad):
+        return False
+    if 2 <= len(t) <= 40 and re.search(r"[A-Za-zА-Яа-я]", t):
+        return True
+    return False
+
+
 def parse_product_page(product_url: str) -> dict:
     html = fetch(product_url)
     soup = BeautifulSoup(html, "lxml")
@@ -128,37 +129,23 @@ def parse_product_page(product_url: str) -> dict:
     page_text = clean_text(soup.get_text(" ", strip=True))
     page_text_lower = page_text.lower()
 
-    # STOCK (простая эвристика)
+    # STOCK
     stock = parse_stock_from_text(page_text_lower)
 
-    # Иногда наличие видно по кнопке
-    btn = soup.select_one("button, .button, .btn")
-    if not stock and btn:
-        bt = clean_text(btn.get_text(" ", strip=True)).lower()
-        if "нет в наличии" in bt:
-            stock = "нет в наличии"
-        elif "в корзину" in bt or "купить" in bt:
-            stock = "в наличии"
-
-    # COLOR
+    # COLOR heuristics
     color = ""
-    # 1) Попробуем найти блок "Цвет" → значение рядом
-    # Часто это label + value или строка в характеристиках
-    for label in soup.select("div, li, span, p"):
-        t = clean_text(label.get_text(" ", strip=True))
-        if not t:
-            continue
-        tl = t.lower()
-        if tl == "цвет" or tl.startswith("цвет:"):
-            # попытаемся взять следующий элемент
-            nxt = label.find_next()
-            if nxt:
-                cand = clean_text(nxt.get_text(" ", strip=True))
-                if looks_like_color(cand):
-                    color = cand
-                    break
 
-    # 2) Часто цвет лежит в свойствах/характеристиках списком
+    # 1) По “Цвет:” рядом
+    for s in soup.stripped_strings:
+        t = clean_text(s)
+        tl = t.lower()
+        if tl.startswith("цвет:"):
+            cand = clean_text(t.split(":", 1)[1])
+            if looks_like_color(cand):
+                color = cand
+                break
+
+    # 2) По спискам характеристик
     if not color:
         props = soup.select(".properties, .product-properties, .characteristics, .product-params, .product__properties")
         for p in props:
@@ -171,9 +158,8 @@ def parse_product_page(product_url: str) -> dict:
             if color:
                 break
 
-    # 3) Последний шанс: берём “похожую” строку рядом с названием
+    # 3) Фоллбек: первая “похожая” строка
     if not color:
-        # небольшая выборка строк
         candidates = []
         for s in soup.stripped_strings:
             st = clean_text(s)
@@ -185,23 +171,18 @@ def parse_product_page(product_url: str) -> dict:
     # SIZES
     sizes = []
 
-    # 1) select / option (часто на сайтах)
     for opt in soup.select("select option"):
         t = clean_text(opt.get_text(" ", strip=True))
         if SIZE_RE.match(t):
             sizes.append(t.upper().replace("  ", " "))
 
-    # 2) кнопки размеров
     for el in soup.select("a, button, span, div"):
         t = clean_text(el.get_text(" ", strip=True))
         if not t:
             continue
-        if SIZE_RE.match(t):
-            # исключим мусор по длине
-            if len(t) <= 10:
-                sizes.append(t.upper().replace("  ", " "))
+        if SIZE_RE.match(t) and len(t) <= 10:
+            sizes.append(t.upper().replace("  ", " "))
 
-    # чистим дубли
     sizes = list(dict.fromkeys(sizes))
 
     return {
@@ -214,13 +195,60 @@ def parse_product_page(product_url: str) -> dict:
     }
 
 
+def save_csv(rows: list[dict], path: str = "output.csv"):
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        fieldnames = ["url", "name", "category", "color", "size", "stock"]
+        w = csv.DictWriter(f, fieldnames=fieldnames)
+        w.writeheader()
+        w.writerows(rows)
+
+
+def write_to_google_sheets(rows: list[dict]):
+    sheet_id = os.getenv("GOOGLE_SHEET_ID", "").strip()
+    sa_json = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON", "").strip()
+
+    if not sheet_id:
+        raise RuntimeError("Нет переменной окружения GOOGLE_SHEET_ID")
+    if not sa_json:
+        raise RuntimeError("Нет переменной окружения GOOGLE_SERVICE_ACCOUNT_JSON")
+
+    info = json.loads(sa_json)
+
+    scopes = [
+        "https://www.googleapis.com/auth/spreadsheets",
+        "https://www.googleapis.com/auth/drive",
+    ]
+    creds = Credentials.from_service_account_info(info, scopes=scopes)
+    gc = gspread.authorize(creds)
+
+    sh = gc.open_by_key(sheet_id)
+    ws = sh.sheet1  # первая вкладка
+
+    header = ["url", "name", "category", "color", "size", "stock"]
+
+    values = [header]
+    for r in rows:
+        values.append([
+            r.get("url", ""),
+            r.get("name", ""),
+            r.get("category", ""),
+            r.get("color", ""),
+            r.get("size", ""),
+            r.get("stock", ""),
+        ])
+
+    # очистим и запишем
+    ws.clear()
+    ws.update(values, value_input_option="RAW")
+
+
 def main():
     catalog_urls = load_catalog_urls()
     if not catalog_urls:
         log("catalog.txt пустой — нечего парсить.")
         return
 
-    all_rows = []
+    all_rows: list[dict] = []
 
     for catalog_url in catalog_urls:
         log(f"\n=== Каталог: {catalog_url} ===")
@@ -280,19 +308,18 @@ def main():
 
                 time.sleep(SLEEP_BETWEEN_REQUESTS_SEC)
 
-            # пауза между страницами каталога
             time.sleep(0.8)
 
-        log(f"Итог по каталогу: товаров увидел ~{total_products_seen}, строк в CSV добавил {total_rows_written}")
+        log(f"Итог по каталогу: товаров увидел ~{total_products_seen}, строк добавил {total_rows_written}")
 
-    # SAVE CSV
-    with open("output.csv", "w", newline="", encoding="utf-8") as f:
-        fieldnames = ["url", "name", "category", "color", "size", "stock"]
-        w = csv.DictWriter(f, fieldnames=fieldnames)
-        w.writeheader()
-        w.writerows(all_rows)
+    # 1) CSV (на всякий)
+    save_csv(all_rows, "output.csv")
+    log("CSV готов: output.csv")
 
-    log("\nГотово: output.csv")
+    # 2) Google Sheets (главное)
+    log("Пишу в Google Sheets...")
+    write_to_google_sheets(all_rows)
+    log("Готово: записал в Google Sheets")
 
 
 if __name__ == "__main__":
