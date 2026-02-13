@@ -182,15 +182,30 @@ def parse_product_page(product_url: str) -> dict:
 
 
 def init_sheet():
+    import base64
+
     sheet_id = os.getenv("GOOGLE_SHEET_ID", "").strip()
-    sa_json = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON", "").strip()
+
+    sa_json_b64 = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON_B64", "").strip()
+    sa_json_plain = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON", "").strip()
 
     if not sheet_id:
         raise RuntimeError("Нет переменной окружения GOOGLE_SHEET_ID")
-    if not sa_json:
-        raise RuntimeError("Нет переменной окружения GOOGLE_SERVICE_ACCOUNT_JSON")
+
+    if sa_json_b64:
+        # самый надежный вариант
+        sa_json = base64.b64decode(sa_json_b64).decode("utf-8")
+    elif sa_json_plain:
+        # на случай если plain всё-таки корректный
+        sa_json = sa_json_plain
+    else:
+        raise RuntimeError("Нет GOOGLE_SERVICE_ACCOUNT_JSON_B64 (и нет GOOGLE_SERVICE_ACCOUNT_JSON)")
+
+    # иногда Render добавляет невидимые символы — подчистим
+    sa_json = sa_json.strip()
 
     info = json.loads(sa_json)
+
     scopes = [
         "https://www.googleapis.com/auth/spreadsheets",
         "https://www.googleapis.com/auth/drive",
