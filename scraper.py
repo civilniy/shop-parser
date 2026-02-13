@@ -8,7 +8,6 @@ from urllib.parse import urljoin
 import requests
 from bs4 import BeautifulSoup
 
-# --- Google Sheets ---
 import gspread
 from google.oauth2.service_account import Credentials
 
@@ -18,7 +17,7 @@ HEADERS = {
 }
 TIMEOUT = 30
 
-MAX_PAGES_PER_CATALOG = 300
+MAX_PAGES_PER_CATALOG = 200
 SLEEP_BETWEEN_REQUESTS_SEC = 0.6
 
 SIZE_RE = re.compile(
@@ -27,6 +26,8 @@ SIZE_RE = re.compile(
     r"\d+([.,]\d+)?)$",
     re.IGNORECASE
 )
+
+HEADER = ["url", "name", "category", "color", "size", "stock"]
 
 
 def log(msg: str):
@@ -45,8 +46,7 @@ def fetch(url: str) -> str:
 
 def load_catalog_urls() -> list[str]:
     with open("catalog.txt", "r", encoding="utf-8") as f:
-        urls = [line.strip() for line in f if line.strip() and not line.strip().startswith("#")]
-    return urls
+        return [line.strip() for line in f if line.strip() and not line.strip().startswith("#")]
 
 
 def catalog_page_url(catalog_url: str, page: int) -> str:
@@ -76,7 +76,6 @@ def extract_product_links_from_catalog(soup: BeautifulSoup, base_url: str) -> li
             continue
         urls.append(full)
 
-    # уникализируем, сохраняя порядок
     seen = set()
     uniq = []
     for u in urls:
@@ -116,36 +115,26 @@ def parse_product_page(product_url: str) -> dict:
     html = fetch(product_url)
     soup = BeautifulSoup(html, "lxml")
 
-    # NAME
     name = ""
     h1 = soup.select_one("h1")
     if h1:
         name = clean_text(h1.get_text(" ", strip=True))
 
-    # CATEGORY
     category = get_breadcrumb_category(soup)
 
-    # PAGE TEXT for stock fallback
     page_text = clean_text(soup.get_text(" ", strip=True))
     page_text_lower = page_text.lower()
-
-    # STOCK
     stock = parse_stock_from_text(page_text_lower)
 
-    # COLOR heuristics
     color = ""
-
-    # 1) По “Цвет:” рядом
     for s in soup.stripped_strings:
         t = clean_text(s)
-        tl = t.lower()
-        if tl.startswith("цвет:"):
+        if t.lower().startswith("цвет:"):
             cand = clean_text(t.split(":", 1)[1])
             if looks_like_color(cand):
                 color = cand
                 break
 
-    # 2) По спискам характеристик
     if not color:
         props = soup.select(".properties, .product-properties, .characteristics, .product-params, .product__properties")
         for p in props:
@@ -158,7 +147,6 @@ def parse_product_page(product_url: str) -> dict:
             if color:
                 break
 
-    # 3) Фоллбек: первая “похожая” строка
     if not color:
         candidates = []
         for s in soup.stripped_strings:
@@ -168,9 +156,7 @@ def parse_product_page(product_url: str) -> dict:
         if candidates:
             color = candidates[0]
 
-    # SIZES
     sizes = []
-
     for opt in soup.select("select option"):
         t = clean_text(opt.get_text(" ", strip=True))
         if SIZE_RE.match(t):
@@ -195,15 +181,7 @@ def parse_product_page(product_url: str) -> dict:
     }
 
 
-def save_csv(rows: list[dict], path: str = "output.csv"):
-    with open(path, "w", newline="", encoding="utf-8") as f:
-        fieldnames = ["url", "name", "category", "color", "size", "stock"]
-        w = csv.DictWriter(f, fieldnames=fieldnames)
-        w.writeheader()
-        w.writerows(rows)
-
-
-def write_to_google_sheets(rows: list[dict]):
+def init_sheet():
     sheet_id = os.getenv("GOOGLE_SHEET_ID", "").strip()
     sa_json = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON", "").strip()
 
@@ -213,7 +191,6 @@ def write_to_google_sheets(rows: list[dict]):
         raise RuntimeError("Нет переменной окружения GOOGLE_SERVICE_ACCOUNT_JSON")
 
     info = json.loads(sa_json)
-
     scopes = [
         "https://www.googleapis.com/auth/spreadsheets",
         "https://www.googleapis.com/auth/drive",
@@ -222,39 +199,53 @@ def write_to_google_sheets(rows: list[dict]):
     gc = gspread.authorize(creds)
 
     sh = gc.open_by_key(sheet_id)
-    ws = sh.sheet1  # первая вкладка
+    ws = sh.sheet1
+    return ws
 
-    header = ["url", "name", "category", "color", "size", "stock"]
 
-    values = [header]
-    for r in rows:
-        values.append([
-            r.get("url", ""),
-            r.get("name", ""),
-            r.get("category", ""),
-            r.get("color", ""),
-            r.get("size", ""),
-            r.get("stock", ""),
-        ])
-
-    # очистим и запишем
+def sheet_reset(ws):
     ws.clear()
-    ws.update(values, value_input_option="RAW")
+    ws.update([HEADER], value_input_option="RAW")
+
+
+def sheet_append_rows(ws, rows: list[list[str]]):
+    # rows: list of [url, name, category, color, size, stock]
+    ws.append_rows(rows, value_input_option="RAW")
+
+
+def save_csv_fallback(all_rows: list[dict], path: str = "output.csv"):
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=HEADER)
+        w.writeheader()
+        w.writerows(all_rows)
 
 
 def main():
+    batch_size = int(os.getenv("SHEETS_BATCH_SIZE", "300"))
     catalog_urls = load_catalog_urls()
     if not catalog_urls:
         log("catalog.txt пустой — нечего парсить.")
         return
 
-    all_rows: list[dict] = []
+    ws = init_sheet()
+    sheet_reset(ws)
+    log("Google Sheet очищен и заголовок записан. Начинаю парсинг...")
+
+    all_rows_dict: list[dict] = []  # только как запасной CSV
+    buffer_rows: list[list[str]] = []
+    total_written = 0
+
+    def flush_buffer():
+        nonlocal total_written, buffer_rows
+        if not buffer_rows:
+            return
+        sheet_append_rows(ws, buffer_rows)
+        total_written += len(buffer_rows)
+        log(f"Записал в Google Sheets: +{len(buffer_rows)} строк (итого {total_written})")
+        buffer_rows = []
 
     for catalog_url in catalog_urls:
         log(f"\n=== Каталог: {catalog_url} ===")
-
-        total_products_seen = 0
-        total_rows_written = 0
 
         for page in range(1, MAX_PAGES_PER_CATALOG + 1):
             page_url = catalog_page_url(catalog_url, page)
@@ -274,34 +265,38 @@ def main():
                 break
 
             log(f"  Нашёл ссылок на товары: {len(product_links)}")
-            total_products_seen += len(product_links)
 
             for i, product_url in enumerate(product_links, 1):
                 try:
-                    log(f"    [{i}/{len(product_links)}] Товар: {product_url}")
+                    log(f"    [{i}/{len(product_links)}] {product_url}")
                     prod = parse_product_page(product_url)
 
                     if prod["sizes"]:
                         for size in prod["sizes"]:
-                            all_rows.append({
+                            row = {
                                 "url": prod["url"],
                                 "name": prod["name"],
                                 "category": prod["category"],
                                 "color": prod["color"],
                                 "size": size,
                                 "stock": prod["stock"]
-                            })
-                            total_rows_written += 1
+                            }
+                            all_rows_dict.append(row)
+                            buffer_rows.append([row[k] for k in HEADER])
                     else:
-                        all_rows.append({
+                        row = {
                             "url": prod["url"],
                             "name": prod["name"],
                             "category": prod["category"],
                             "color": prod["color"],
                             "size": "",
                             "stock": prod["stock"]
-                        })
-                        total_rows_written += 1
+                        }
+                        all_rows_dict.append(row)
+                        buffer_rows.append([row[k] for k in HEADER])
+
+                    if len(buffer_rows) >= batch_size:
+                        flush_buffer()
 
                 except Exception as e:
                     log(f"      Ошибка парсинга товара: {e}")
@@ -310,16 +305,12 @@ def main():
 
             time.sleep(0.8)
 
-        log(f"Итог по каталогу: товаров увидел ~{total_products_seen}, строк добавил {total_rows_written}")
+    # финальная запись
+    flush_buffer()
 
-    # 1) CSV (на всякий)
-    save_csv(all_rows, "output.csv")
-    log("CSV готов: output.csv")
-
-    # 2) Google Sheets (главное)
-    log("Пишу в Google Sheets...")
-    write_to_google_sheets(all_rows)
-    log("Готово: записал в Google Sheets")
+    # запасной CSV
+    save_csv_fallback(all_rows_dict, "output.csv")
+    log("Готово. Таблица заполнена, CSV сохранён как запасной вариант (output.csv).")
 
 
 if __name__ == "__main__":
